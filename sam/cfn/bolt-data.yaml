@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: System to track MyChevy data in Athena
+
+Parameters:
+  SSMPathRoot:
+    Description: Top Level SSM Path for credentials
+    Type: String
+
+  SSMUser:
+    Description: credentials - User
+    Type: String
+
+  DataBucket:
+    Description: S3 Bucket to output data to
+    Type: String
+
+  TopicARN:
+    Description: The ARN for the SNS topic to notify on alarms.
+    Type: String
+
+
+Resources:
+  BoltDataExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+                - "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        -
+          PolicyName: "MyChevyParameters"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            -
+              Effect: Allow
+              Action: "ssm:GetParameter"
+              Resource: !Sub "arn:aws:ssm:us-east-1:${AWS::AccountId}:parameter${SSMPathRoot}/*"
+            -
+              Effect: Allow
+              Action: "ssm:GetParametersByPath"
+              Resource: !Sub "arn:aws:ssm:us-east-1:${AWS::AccountId}:parameter${SSMPathRoot}"
+            -
+              Effect: Allow
+              Action: "ssm:GetParameters"
+              Resource: !Sub "arn:aws:ssm:us-east-1:${AWS::AccountId}:parameter${SSMPathRoot}/*"
+
+  BoltDataKey:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Description: "The Key used in Management of the MyChevy Data Gatherer"
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: "key-default-1"
+        Statement:
+          -
+            Sid: "Allow administration of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !Sub "arn:aws:sts::${AWS::AccountId}:root"
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+              - "kms:Encrypt"
+            Resource: "*"
+          -
+            Sid: "Allow use of the key"
+            Effect: "Allow"
+            Principal:
+              AWS: !GetAtt BoltDataExecutionRole.Arn
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+
+  BoltDataParamUser:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "${SSMPathRoot}/user"
+      Description: "User for MyChevy Auth"
+      Type: String
+      Value: !Ref SSMUser
+
+
+  BoltDataContentAPICall:
+    FunctionName: "Learn-BoltDataContentAPICall"
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: gather-data.lambda_handler
+      Runtime: python3.7
+      CodeUri: sam/functions/
+      Description: 'Function to gather data from the Chevy site'
+      MemorySize: 256
+      Timeout: 900
+      Role: !GetAtt BoltDataExecutionRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucket
+          SSMPATHROOT: !Ref SSMPathRoot
+          SSMKEY: !GetAtt BoltDataKey.Arn
+
+  boltDataScheduleHourly:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Run the Daily Cleanup Schedule
+      ScheduleExpression: "cron(0/15 * * * ? *)"
+      State: ENABLED
+      RoleArn: !GetAtt BoltDataExecutionRole.Arn
+      Targets:
+        -
+          Arn: !GetAtt BoltDataContentAPICall.Arn
+          Id: !Ref BoltDataContentAPICall
+          Input: '{ "schedule": "hourly" }'
+
+  invokeBoltDataScheduleHourly:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref BoltDataContentAPICall
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt boltDataScheduleHourly.Arn
+
+  CloudWatchErrorAlarmBoltData:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+      - !Ref 'TopicARN'
+      AlarmDescription: BoltData Error Check
+      AlarmName: BoltData-Errors
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: '1'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: '60'
+      Statistic: Sum
+      Threshold: '0'
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref BoltDataContentAPICall
+
+  CloudWatchInvokeAlarmBoltData:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+      - !Ref 'TopicARN'
+      AlarmDescription: BoltData Invoke Check
+      AlarmName: BoltData-Invokes
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: '1'
+      MetricName: Invocations
+      Namespace: AWS/Lambda
+      Period: '60'
+      Statistic: Sum
+      Threshold: '0'
+      Dimensions:
+      - Name: FunctionName
+        Value: !Ref BoltDataContentAPICall
+
+  dataBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref DataBucket
+
+Outputs:
+  BoltDataKeyArn:
+    Value: !GetAtt BoltDataKey.Arn
